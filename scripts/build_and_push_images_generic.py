@@ -60,6 +60,8 @@ def _make_dockerfile(spec: dict, repo: str, base_commit: str) -> str:
         base = spec.get("base_image") or f"python:{version or '3.11'}-slim"
     elif lang == "go":
         base = f"golang:{version}" if version else "golang:latest"
+    elif lang == "typescript":
+        base = spec.get("base_image") or f"node:{version or '20'}-slim"
     else:
         base = "ubuntu:24.04"
 
@@ -73,6 +75,11 @@ def _make_dockerfile(spec: dict, repo: str, base_commit: str) -> str:
             "RUN apt-get update -qq && "
             "apt-get install -y --no-install-recommends git"
         )
+    elif lang == "typescript" and not spec.get("base_image"):
+        lines.append(
+            "RUN apt-get update -qq && "
+            "apt-get install -y --no-install-recommends git ca-certificates"
+        )
 
     if sys_deps:
         pkgs = " ".join(sys_deps)
@@ -81,7 +88,7 @@ def _make_dockerfile(spec: dict, repo: str, base_commit: str) -> str:
             f"apt-get install -y --no-install-recommends {pkgs} && "
             "rm -rf /var/lib/apt/lists/*"
         )
-    elif lang == "python" and not spec.get("base_image"):
+    elif lang in ("python", "typescript") and not spec.get("base_image"):
         lines.append("RUN rm -rf /var/lib/apt/lists/*")
 
     lines.append(_git_clone_or_archive(repo, base_commit))
@@ -89,11 +96,19 @@ def _make_dockerfile(spec: dict, repo: str, base_commit: str) -> str:
     if lang == "go" and spec.get("goflags"):
         lines.append(f'ENV GOFLAGS="{spec["goflags"]}"')
 
+    if lang == "typescript":
+        lines.append("RUN corepack enable || true")
+        if not install_cmd:
+            install_cmd = "npm ci || npm install"
+
     for cmd in pre_install:
         lines.append(f"RUN cd /repo && {cmd}")
 
     if install_cmd:
-        lines.append(f"RUN cd /repo && {install_cmd}")
+        if lang == "typescript":
+            lines.append(f"RUN cd /repo && ( {install_cmd} )")
+        else:
+            lines.append(f"RUN cd /repo && {install_cmd}")
 
     if pip_packages:
         pkg_str = " ".join(f"'{p}'" for p in pip_packages)

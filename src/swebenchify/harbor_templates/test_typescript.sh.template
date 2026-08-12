@@ -1,0 +1,103 @@
+#!/bin/bash
+set -uxo pipefail
+
+cd /testbed
+
+# Ensure git trusts the directory
+git config --global --add safe.directory /testbed
+
+# Capture agent's patch before any reverts (for analysis/dashboard)
+git diff HEAD > /logs/artifacts/candidate_patch.diff 2>/dev/null || true
+git diff HEAD --stat > /logs/artifacts/patch_stat.txt 2>/dev/null || true
+
+# --- Phase 1: Apply test patch ---
+# Anti-reward-hacking: revert ONLY test file modifications
+# Agent's source changes are preserved for grading
+# (graded with node: the node:slim image ships no python)
+node -e '
+const cp = require("child_process");
+const fs = require("fs");
+const pats = [
+  /(^|\/)tests?\//, /(^|\/)e2e\//, /(^|\/)testing\//, /(^|\/)testdata\//,
+  /(^|\/)__tests__\//, /(^|\/)src\/test\//,
+  /_test\.(go|rs|py|cjs|mjs|jsx?|tsx?)$/,
+  /^test_/, /\.test\./, /_spec\./, /\.spec\./,
+  /conftest\.py$/,
+];
+const listed = (args) => cp.execFileSync("git", args, {encoding: "utf8"}).split("\n");
+for (const f of listed(["diff", "--name-only"])) {
+  if (f && pats.some((p) => p.test(f))) {
+    try { cp.execFileSync("git", ["checkout", "--", f]); } catch (e) {}
+  }
+}
+for (const f of listed(["ls-files", "--others", "--exclude-standard"])) {
+  if (f && pats.some((p) => p.test(f))) {
+    try { fs.unlinkSync(f); } catch (e) {}
+  }
+}
+' 2>/dev/null || true
+
+# Apply test patch (adds/modifies test files that catch the bug)
+git apply --3way /tests/test.patch 2>&1 || git apply /tests/test.patch 2>&1 || {
+    echo "TEST_PATCH_APPLY_FAILED"
+    echo 0 > /logs/verifier/reward.txt
+    exit 0
+}
+
+# --- Phase 2: Run tests ---
+# $test_command carries the jest/vitest flags that write the JSON report to
+# /tmp/swebenchify-ts-report.json (added by the emitter). Remove any stale
+# report first so a crashed run cannot surface previous results.
+rm -f /tmp/swebenchify-ts-report.json
+LOG_FILE=$$(mktemp)
+
+echo '>>>>> Start Test Output'
+
+$test_command > "$$LOG_FILE" 2>&1 || true
+cat "$$LOG_FILE"
+
+echo '>>>>> End Test Output'
+
+# --- Phase 3: Grade results ---
+# Parse the JSON report and check against expected FAIL_TO_PASS / PASS_TO_PASS.
+# Test IDs are "{relative/suite/path}::{fullName}" — must match
+# TypeScriptJestJSONParser in src/swebenchify/parsers.py.
+node -e '
+const fs = require("fs");
+let report = {};
+try { report = JSON.parse(fs.readFileSync("/tmp/swebenchify-ts-report.json", "utf8")); } catch (e) {}
+const cfg = JSON.parse(fs.readFileSync("/tests/config.json", "utf8"));
+const load = (v) => (typeof v === "string" ? JSON.parse(v) : (v || []));
+const f2p = load(cfg.FAIL_TO_PASS);
+const p2p = load(cfg.PASS_TO_PASS);
+const results = {};
+for (const suite of report.testResults || []) {
+  let p = String(suite.name || suite.testFilePath || "");
+  for (const root of ["/testbed/", "/repo/"]) {
+    if (p.indexOf(root) === 0) p = p.slice(root.length);
+  }
+  for (const a of suite.assertionResults || []) {
+    let full = a.fullName;
+    if (!full) {
+      const parts = (a.ancestorTitles || []).concat([a.title || ""]);
+      full = parts.filter(Boolean).join(" ");
+    }
+    if (!full) continue;
+    const status = a.status === "passed" ? "passed" : (a.status === "failed" ? "failed" : "skipped");
+    const id = p + "::" + full;
+    if (!(id in results) || status === "failed") results[id] = status;
+  }
+}
+const allPass = f2p.length > 0 && f2p.every((t) => results[t] === "passed") && p2p.every((t) => results[t] !== "failed");
+fs.writeFileSync("/logs/verifier/reward.txt", allPass ? "1\n" : "0\n");
+const vals = Object.keys(results).map((k) => results[k]);
+const summary = {
+  test_results: results,
+  total_tests: vals.length,
+  passed: vals.filter((s) => s === "passed").length,
+  failed: vals.filter((s) => s === "failed").length,
+};
+fs.writeFileSync("/logs/verifier/report.json", JSON.stringify(summary, null, 2));
+' || echo 0 > /logs/verifier/reward.txt
+
+exit 0

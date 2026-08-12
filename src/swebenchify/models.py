@@ -169,6 +169,24 @@ def compute_java_env_spec_hash(spec: EnvironmentSpec) -> str:
     return digest
 
 
+def compute_typescript_env_spec_hash(spec: EnvironmentSpec) -> str:
+    """Return a stable SHA-256 hex digest of a TypeScript EnvironmentSpec."""
+    payload = {
+        "language": spec.language,
+        "language_version": spec.language_version,
+        "package_manager": spec.package_manager,
+        "install_cmd": spec.install_cmd,
+        "test_cmd": spec.test_cmd,
+        "pre_install": sorted(spec.pre_install),
+        "system_dependencies": sorted(spec.system_dependencies),
+        "base_image": spec.base_image,
+    }
+    serialised = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(serialised.encode()).hexdigest()
+    logger.debug("computed TypeScript env_spec_hash=%s", digest[:12])
+    return digest
+
+
 @dataclass
 class RustEnvironmentSpec:
     """Build and test configuration for a Rust repository version.

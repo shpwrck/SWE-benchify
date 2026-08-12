@@ -14,7 +14,7 @@ import shlex
 import string
 from pathlib import Path
 
-from swebenchify.backends import get_backend
+from swebenchify.backends import get_backend, ts_report_command
 from swebenchify.models import (
     AnyEnvironmentSpec,
     EnvironmentSpec,
@@ -32,6 +32,7 @@ _DEFAULT_VERIFIER_TIMEOUT: dict[str, float] = {
     "python": 600.0,
     "java": 900.0,
     "rust": 600.0,
+    "typescript": 600.0,
 }
 
 _DEFAULT_AGENT_TIMEOUT: dict[str, float] = {
@@ -39,6 +40,7 @@ _DEFAULT_AGENT_TIMEOUT: dict[str, float] = {
     "python": 1800.0,
     "java": 1800.0,
     "rust": 1800.0,
+    "typescript": 1800.0,
 }
 
 
@@ -229,6 +231,9 @@ class HarborTaskGenerator:
         if isinstance(env_spec, EnvironmentSpec):
             if env_spec.base_image:
                 return f"FROM {env_spec.base_image}"
+            if env_spec.language == "typescript":
+                version = env_spec.language_version or "20"
+                return f"FROM node:{version}-slim"
             version = env_spec.language_version or "3.11"
             return f"FROM python:{version}-slim"
 
@@ -237,6 +242,7 @@ class HarborTaskGenerator:
             "python": "FROM python:3.11-slim",
             "java": "FROM maven:3-eclipse-temurin-17",
             "rust": "FROM rust:latest",
+            "typescript": "FROM node:20-slim",
         }
         return defaults.get(language, "FROM ubuntu:22.04")
 
@@ -263,10 +269,19 @@ class HarborTaskGenerator:
                     f"apt-get install -y --no-install-recommends {pkgs} && "
                     f"rm -rf /var/lib/apt/lists/*"
                 )
+            if env_spec.language == "typescript":
+                lines.append("RUN corepack enable || true")
             for cmd in env_spec.pre_install:
                 lines.append(f"RUN cd /testbed && {cmd}")
             if env_spec.install_cmd:
-                lines.append(f"RUN cd /testbed && {env_spec.install_cmd}")
+                if env_spec.language == "typescript":
+                    # Parenthesised so a "npm ci || npm install" fallback
+                    # chain stays anchored to /testbed.
+                    lines.append(f"RUN cd /testbed && ( {env_spec.install_cmd} )")
+                else:
+                    lines.append(f"RUN cd /testbed && {env_spec.install_cmd}")
+            elif env_spec.language == "typescript":
+                lines.append("RUN cd /testbed && ( npm ci || npm install ) || true")
 
         elif isinstance(env_spec, RustEnvironmentSpec):
             lines.append(
@@ -296,6 +311,9 @@ class HarborTaskGenerator:
                 lines.append("RUN cd /testbed && mvn dependency:resolve -B 2>/dev/null || true")
             elif language == "rust":
                 lines.append("RUN cd /testbed && cargo fetch 2>/dev/null || true")
+            elif language == "typescript":
+                lines.append("RUN corepack enable || true")
+                lines.append("RUN cd /testbed && ( npm ci || npm install ) || true")
 
         return "\n".join(lines) if lines else "# No extra setup required"
 
@@ -323,6 +341,8 @@ class HarborTaskGenerator:
             template_name = "test_java.sh.template"
         elif language == "rust":
             template_name = "test_rust.sh.template"
+        elif language == "typescript":
+            template_name = "test_typescript.sh.template"
         else:
             raise ValueError(f"Unsupported language: {language}")
 
@@ -373,6 +393,18 @@ class HarborTaskGenerator:
 
         if language == "rust":
             return "cargo test 2>&1"
+
+        if language == "typescript":
+            scope = ""
+            if instance.test_patch and backend:
+                scope = backend.test_scope(instance.test_patch)
+            raw = "npx vitest run"
+            if env_spec and isinstance(env_spec, EnvironmentSpec) and env_spec.test_cmd:
+                raw = env_spec.test_cmd
+            cmd = f"CI=1 {ts_report_command(raw)}"
+            if scope:
+                return f"{cmd} {scope}"
+            return cmd
 
         return "echo 'Unsupported language'"
 

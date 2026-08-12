@@ -2,8 +2,8 @@
 """Unified pipeline: collect PRs, extract candidates, validate, emit instances.
 
 Runs the full SWE-benchify pipeline for any supported language (Python, Java,
-Rust). Language-specific behavior (env detection, test filtering, patch
-refinement) is dispatched via a registry.
+Rust, TypeScript). Language-specific behavior (env detection, test filtering,
+patch refinement) is dispatched via a registry.
 
 Usage::
 
@@ -48,6 +48,7 @@ from swebenchify.models import (
     compute_java_env_spec_hash,
     compute_python_env_spec_hash,
     compute_rust_env_spec_hash,
+    compute_typescript_env_spec_hash,
 )
 from swebenchify.remote import build_task_instances
 
@@ -146,10 +147,56 @@ def _detect_rust(repo: str, root: Path) -> dict:
     return detected
 
 
+def _detect_typescript(repo: str, root: Path) -> dict:
+    detected: dict = {}
+    pkg_json = root / "package.json"
+    if pkg_json.exists():
+        try:
+            data = json.loads(pkg_json.read_text())
+        except (json.JSONDecodeError, OSError):
+            data = {}
+        engines = (data.get("engines") or {}).get("node", "")
+        m = re.search(r"(\d+)", str(engines))
+        if m:
+            detected["node_version"] = m.group(1)
+
+        # "packageManager": "pnpm@8.6.0" (corepack pin) wins over lockfiles
+        pm_field = str(data.get("packageManager", ""))
+        for pm in ("pnpm", "yarn", "npm"):
+            if pm_field.startswith(pm):
+                detected["package_manager"] = pm
+                break
+
+        deps = {
+            **(data.get("dependencies") or {}),
+            **(data.get("devDependencies") or {}),
+        }
+        if "vitest" in deps:
+            detected["test_runner"] = "vitest"
+        elif "jest" in deps:
+            detected["test_runner"] = "jest"
+
+    nvmrc = root / ".nvmrc"
+    if nvmrc.exists() and "node_version" not in detected:
+        m = re.search(r"(\d+)", nvmrc.read_text().strip())
+        if m:
+            detected["node_version"] = m.group(1)
+
+    if "package_manager" not in detected:
+        if (root / "pnpm-lock.yaml").exists():
+            detected["package_manager"] = "pnpm"
+        elif (root / "yarn.lock").exists():
+            detected["package_manager"] = "yarn"
+        elif (root / "package-lock.json").exists():
+            detected["package_manager"] = "npm"
+    return detected
+
+
 _DETECTORS = {
     "python": _detect_python,
     "java": _detect_java,
     "rust": _detect_rust,
+    "typescript": _detect_typescript,
 }
 
 
@@ -238,6 +285,30 @@ def build_env_spec(
         spec.env_spec_hash = compute_java_env_spec_hash(spec)
         return spec
 
+    if language == "typescript":
+        pm = auto.get("package_manager", "npm")
+        install_defaults = {
+            "npm": "npm ci || npm install",
+            "pnpm": "pnpm install --frozen-lockfile || pnpm install",
+            "yarn": "yarn install --frozen-lockfile || yarn install",
+        }
+        runner = auto.get("test_runner", "vitest")
+        default_test = "npx vitest run" if runner == "vitest" else "npx jest"
+        spec = EnvironmentSpec(
+            language="typescript",
+            language_version=str(args.lang_version or auto.get("node_version", "20")),
+            package_manager=pm,
+            install_cmd=args.install_cmd or install_defaults[pm],
+            test_cmd=args.test_cmd or default_test,
+            pre_install=pre_install,
+            pip_packages=[],
+            system_dependencies=system_deps,
+            base_image=args.base_image or "",
+            run_preamble=args.run_preamble or "",
+        )
+        spec.env_spec_hash = compute_typescript_env_spec_hash(spec)
+        return spec
+
     if language == "rust":
         workspace_members: list[str] = []
         if isinstance(auto.get("workspace_members"), list):
@@ -282,6 +353,7 @@ _DEFAULTS = {
     "python": {"max_prs": 300, "timeout": 600},
     "java": {"max_prs": 500, "timeout": 900},
     "rust": {"max_prs": 500, "timeout": 600},
+    "typescript": {"max_prs": 300, "timeout": 600},
 }
 
 
@@ -294,7 +366,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Run the full SWE-benchify pipeline for a GitHub repo.",
     )
     parser.add_argument("--language", required=True,
-                        choices=["python", "java", "rust"],
+                        choices=["python", "java", "rust", "typescript"],
                         help="Target language")
     parser.add_argument("--repo", required=True, help="GitHub repo (owner/repo)")
     parser.add_argument("--output", type=Path, default=None,
@@ -328,11 +400,11 @@ def main(argv: list[str] | None = None) -> int:
     env_group.add_argument("--skip-detection", action="store_true",
                            help="Skip auto-detection, use defaults + overrides only")
 
-    py_group = parser.add_argument_group("python-specific options")
+    py_group = parser.add_argument_group("python/typescript-specific options")
     py_group.add_argument("--base-image", default=None,
-                          help="Custom Docker base image (python only)")
+                          help="Custom Docker base image (python/typescript only)")
     py_group.add_argument("--run-preamble", default=None,
-                          help="Shell commands to run before tests (python only)")
+                          help="Shell commands to run before tests (python/typescript only)")
 
     rust_group = parser.add_argument_group("rust-specific options")
     rust_group.add_argument("--build-cmd", default=None,

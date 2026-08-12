@@ -403,6 +403,132 @@ def normalize_rust_f2p(test_ids: list[str]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# TypeScript / JavaScript test output parsing (jest & vitest JSON reports)
+# ---------------------------------------------------------------------------
+
+# Path prefixes stripped from suite file paths so test IDs are stable across
+# the two container layouts (grader clones to /repo, Harbor mounts /testbed).
+_TS_REPO_ROOTS = ("/repo/", "/testbed/")
+
+
+def _normalize_ts_suite_path(path: str) -> str:
+    """Make a jest/vitest suite file path repo-relative."""
+    for root in _TS_REPO_ROOTS:
+        if path.startswith(root):
+            return path[len(root):]
+    return path.removeprefix("./")
+
+
+class TypeScriptJestJSONParser:
+    """Parse the JSON report emitted by jest (``--json``) or vitest
+    (``--reporter=json``).
+
+    Vitest's JSON reporter is intentionally jest-compatible, so one parser
+    covers both runners.  The report is a single JSON object with a
+    ``testResults`` list of suites; each suite carries ``assertionResults``
+    with per-test ``fullName``/``title`` and ``status``.
+
+    Test IDs are ``"{relative/suite/path}::{fullName}"`` — the fullName is
+    the space-joined describe-block chain plus the test title, which is the
+    stable identity both runners report.
+
+    The raw output may contain non-JSON noise (git apply output, phase
+    markers); the parser scans for the report object and ignores the rest.
+    A section with no parseable report and no tests is treated as a
+    compile/transform failure (``compiled=False``), mirroring the Go
+    parser's "package failed with zero test events" rule.
+    """
+
+    def _find_report(self, raw_output: str) -> dict | None:
+        for line in raw_output.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict) and "testResults" in data:
+                return data
+        # Fallback: a pretty-printed report spanning multiple lines — parse
+        # from the first line that opens an object to the last closing brace.
+        end = raw_output.rfind("}")
+        pos = 0
+        for line in raw_output.splitlines(keepends=True):
+            stripped = line.lstrip()
+            if stripped.startswith("{"):
+                start = pos + line.find("{")
+                if end > start:
+                    try:
+                        data = json.loads(raw_output[start:end + 1])
+                    except json.JSONDecodeError:
+                        data = None
+                    if isinstance(data, dict) and "testResults" in data:
+                        return data
+            pos += len(line)
+        return None
+
+    def parse(self, raw_output: str) -> ParseResult:
+        if not raw_output or not raw_output.strip():
+            return ParseResult(tests={}, compiled=False)
+
+        data = self._find_report(raw_output)
+        if data is None:
+            return ParseResult(tests={}, compiled=False)
+
+        tests: dict[str, str] = {}
+        for suite in data.get("testResults") or []:
+            if not isinstance(suite, dict):
+                continue
+            suite_path = _normalize_ts_suite_path(
+                str(suite.get("name") or suite.get("testFilePath") or "")
+            )
+            for assertion in suite.get("assertionResults") or []:
+                if not isinstance(assertion, dict):
+                    continue
+                full_name = assertion.get("fullName")
+                if not full_name:
+                    parts = list(assertion.get("ancestorTitles") or [])
+                    parts.append(str(assertion.get("title") or ""))
+                    full_name = " ".join(p for p in parts if p)
+                if not full_name:
+                    continue
+                raw_status = assertion.get("status", "")
+                if raw_status == "passed":
+                    status = "passed"
+                elif raw_status == "failed":
+                    status = "failed"
+                else:
+                    # pending / skipped / todo / disabled
+                    status = "skipped"
+                test_id = f"{suite_path}::{full_name}"
+                # For duplicate test IDs, "failed" takes priority
+                if test_id not in tests or status == "failed":
+                    tests[test_id] = status
+
+        # No individual tests ran and the run was not a success: the suite
+        # failed to load (tsc/transform error, missing dependency, ...).
+        compiled = True
+        if not tests:
+            failed_suites = data.get("numFailedTestSuites") or 0
+            if failed_suites or not data.get("success", True):
+                compiled = False
+
+        return ParseResult(tests=tests, compiled=compiled)
+
+
+def normalize_typescript_f2p(test_ids: list[str]) -> list[str]:
+    """Deduplicate and sort TypeScript test IDs (already stable as emitted)."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for tid in test_ids:
+        if tid not in seen:
+            seen.add(tid)
+            result.append(tid)
+    return sorted(result)
+
+
+# ---------------------------------------------------------------------------
 # Auto-register built-in parsers on import
 # ---------------------------------------------------------------------------
 
@@ -410,3 +536,4 @@ register("go", GoJSONParser())
 register("python", PytestVerboseParser())
 register("java", MavenSurefireParser())
 register("rust", RustTestParser())
+register("typescript", TypeScriptJestJSONParser())
