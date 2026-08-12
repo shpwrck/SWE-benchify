@@ -714,11 +714,16 @@ def compute_f2p(
     if timeout is None:
         timeout = backend.default_timeout
 
-    has_test_file = any(
-        backend.test_file_pattern in line
-        for line in test_patch.splitlines()
-        if line.startswith("diff --git")
-    )
+    if backend.has_test_file is not None:
+        has_test_file = backend.has_test_file(test_patch)
+        missing_msg = f"test_patch contains no runnable {backend.name} test files"
+    else:
+        has_test_file = any(
+            backend.test_file_pattern in line
+            for line in test_patch.splitlines()
+            if line.startswith("diff --git")
+        )
+        missing_msg = f"test_patch contains no {backend.test_file_pattern} files"
     if not has_test_file and test_patch.strip():
         logger.info(
             "compute_f2p finished: repo=%s status=invalid f2p=0 p2p=0 elapsed=0.0s",
@@ -726,7 +731,7 @@ def compute_f2p(
         )
         return ValidationResult(
             status="invalid",
-            error_message=f"test_patch contains no {backend.test_file_pattern} files",
+            error_message=missing_msg,
         )
 
     t0 = time.monotonic()

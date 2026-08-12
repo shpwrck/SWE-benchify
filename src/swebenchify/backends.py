@@ -52,6 +52,12 @@ class LanguageBackend:
     test_scope: Callable[[str], str]
     normalize_f2p: Callable[[list[str]], list[str]]
     is_test_hunk: Callable[[Any, list[tuple[int, int]] | None], bool] | None = field(default=None)
+    # Optional override for the grader's "does the test patch touch any
+    # runnable test file" gate. When None, the grader falls back to the
+    # test_file_pattern substring check. Needed when no single substring
+    # can describe the language's test files (TypeScript tests may be
+    # .ts/.tsx/.js/.jsx/.mjs/.cjs).
+    has_test_file: Callable[[str], bool] | None = field(default=None)
 
 
 # ---------------------------------------------------------------------------
@@ -693,6 +699,17 @@ def _ts_make_test_cmd(env_spec: AnyEnvironmentSpec) -> str:
 _TS_TEST_BASENAME_RE = re.compile(r"(?:^|\.)(?:test|spec)\.(?:c|m)?[jt]sx?$")
 
 
+def _ts_has_test_file(test_patch: str) -> bool:
+    """Gate predicate: does the test patch touch any runnable test file?
+
+    Reuses the scope derivation so the gate and the scope can never
+    disagree — a candidate passes the gate exactly when the runner would
+    be handed at least one test file (.ts/.tsx/.js/.jsx/.mjs/.cjs test
+    conventions included, unlike the ".ts" substring this replaces).
+    """
+    return bool(_ts_test_scope(test_patch))
+
+
 def _ts_test_scope(test_patch: str) -> str:
     """Return space-separated test file paths from diff headers."""
     files: list[str] = []
@@ -778,4 +795,5 @@ register_backend(LanguageBackend(
     make_test_cmd=_ts_make_test_cmd,
     test_scope=_ts_test_scope,
     normalize_f2p=normalize_typescript_f2p,
+    has_test_file=_ts_has_test_file,
 ))
