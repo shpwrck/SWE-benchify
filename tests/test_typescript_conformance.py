@@ -180,6 +180,58 @@ class TestTypeScriptTestScope:
         assert get_backend("typescript").test_scope(diff) == ""
 
 
+class TestTypeScriptGate:
+    """The grader gate uses the backend's has_test_file predicate, so
+    .js/.mjs/.cjs test files are accepted and source-only patches are
+    rejected (the old ".ts" substring did the opposite on both counts)."""
+
+    MJS_DIFF = (
+        "diff --git a/scripts/audit.test.mjs b/scripts/audit.test.mjs\n"
+        "--- a/scripts/audit.test.mjs\n"
+        "+++ b/scripts/audit.test.mjs\n"
+    )
+    SRC_ONLY_DIFF = (
+        "diff --git a/src/util.ts b/src/util.ts\n"
+        "--- a/src/util.ts\n"
+        "+++ b/src/util.ts\n"
+    )
+
+    def test_predicate_accepts_mjs_tests(self):
+        backend = get_backend("typescript")
+        assert backend.has_test_file is not None
+        assert backend.has_test_file(self.MJS_DIFF) is True
+
+    def test_predicate_accepts_jsx_spec(self):
+        backend = get_backend("typescript")
+        diff = (
+            "diff --git a/src/App.spec.jsx b/src/App.spec.jsx\n"
+            "--- a/src/App.spec.jsx\n"
+            "+++ b/src/App.spec.jsx\n"
+        )
+        assert backend.has_test_file(diff) is True
+
+    def test_predicate_rejects_source_only_patch(self):
+        backend = get_backend("typescript")
+        assert backend.has_test_file(self.SRC_ONLY_DIFF) is False
+
+    def test_gate_agrees_with_scope(self):
+        """Gate passes exactly when the runner would get >=1 test file."""
+        backend = get_backend("typescript")
+        for diff in (self.MJS_DIFF, self.SRC_ONLY_DIFF):
+            assert backend.has_test_file(diff) == bool(backend.test_scope(diff))
+
+    def test_grader_rejects_source_only_before_docker(self, monkeypatch):
+        from swebenchify import grader
+        monkeypatch.setattr(grader, "_docker_available", lambda: True)
+        result = grader.compute_f2p(
+            repo="owner/repo", base_commit="a" * 40,
+            test_patch=self.SRC_ONLY_DIFF, gold_patch="",
+            env_spec=_ts_spec(),
+        )
+        assert result.status == "invalid"
+        assert "no runnable typescript test" in result.error_message
+
+
 class TestTypeScriptFileClassification:
     def test_tests_dunder_dir_is_test(self):
         from swebenchify.extractor import is_test_file
