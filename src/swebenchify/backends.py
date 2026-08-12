@@ -29,8 +29,10 @@ from swebenchify.parsers import (
     PytestVerboseParser,
     RustTestParser,
     TestLogParser,
+    TypeScriptJestJSONParser,
     normalize_go_f2p,
     normalize_rust_f2p,
+    normalize_typescript_f2p,
 )
 
 logger = logging.getLogger(__name__)
@@ -556,6 +558,164 @@ def _rust_is_test_hunk(
 
 
 # ---------------------------------------------------------------------------
+# TypeScript backend helpers
+# ---------------------------------------------------------------------------
+
+# The jest/vitest JSON report is written to a file and cat'ed afterwards so
+# the parser sees clean JSON instead of stdout/stderr interleaved with
+# human-readable runner output.
+_TS_REPORT_PATH = "/tmp/swebenchify-ts-report.json"
+
+
+def _ts_make_dockerfile(repo: str, base_commit: str, env_spec: AnyEnvironmentSpec, *, repo_tarball: bool = False) -> str:
+    spec = env_spec if isinstance(env_spec, EnvironmentSpec) else None
+
+    if spec and spec.base_image:
+        base = spec.base_image
+    else:
+        version = (spec.language_version if spec else None) or "20"
+        base = f"node:{version}-slim"
+
+    source_url = "https://github.com/Red-Hat-AI-Innovation-Team/SWE-benchify"
+    lines = [
+        f"FROM {base}",
+        f"LABEL org.opencontainers.image.source={source_url}",
+    ]
+
+    if not (spec and spec.base_image):
+        lines.append(
+            "RUN apt-get update -qq && "
+            "apt-get install -y --no-install-recommends git ca-certificates"
+        )
+
+    if spec and spec.system_dependencies:
+        pkgs = " ".join(spec.system_dependencies)
+        lines.append(
+            "RUN apt-get update -qq && "
+            f"apt-get install -y --no-install-recommends {pkgs}"
+        )
+
+    lines.append("RUN rm -rf /var/lib/apt/lists/*")
+
+    if repo_tarball:
+        lines.append("COPY repo.tar.gz /tmp/repo.tar.gz")
+        lines.append("RUN mkdir -p /repo && cd /repo && tar xzf /tmp/repo.tar.gz")
+    else:
+        lines.append(_git_clone_or_archive(repo, base_commit))
+
+    # A tarball can preserve a non-root uid (mapping to the node image's
+    # "node" user), which trips git's dubious-ownership check at run time.
+    lines.append("RUN git config --global --add safe.directory /repo || true")
+
+    # corepack activates the pnpm/yarn version pinned by "packageManager"
+    lines.append("RUN corepack enable || true")
+
+    if spec:
+        for cmd in spec.pre_install:
+            lines.append(f"RUN cd /repo && ( {cmd} )")
+    install_cmd = (spec.install_cmd if spec else None) or "npm ci || npm install"
+    lines.append(f"RUN cd /repo && ( {install_cmd} )")
+
+    lines.append("COPY test.patch /patches/test.patch")
+    lines.append("COPY gold.patch /patches/gold.patch")
+    return "\n".join(lines) + "\n"
+
+
+_TS_VITEST_NO_RUN_RE = re.compile(r"\bvitest\b(?!\s+run)")
+
+
+def normalize_ts_runner_cmd(raw_cmd: str) -> str:
+    """Normalise a jest/vitest invocation for non-interactive use.
+
+    - Bare ``vitest`` becomes ``vitest run`` (watch mode would hang the
+      container even though callers also set ``CI=1``).
+    - ``npm test`` / ``npm run ...`` get a trailing ``--`` so that any
+      flags appended by callers are forwarded to the underlying runner
+      instead of being consumed by npm.
+
+    Shared by the F2P validation wrapper, the Harbor emitter, and the
+    eval harness so the three stay in agreement.
+    """
+    if "vitest" in raw_cmd:
+        raw_cmd = _TS_VITEST_NO_RUN_RE.sub("vitest run", raw_cmd, count=1)
+    if (
+        re.match(r"^\s*npm\s+(test|run)\b", raw_cmd)
+        and " -- " not in raw_cmd
+        and not raw_cmd.rstrip().endswith(" --")
+    ):
+        raw_cmd += " --"
+    return raw_cmd
+
+
+def ts_report_command(raw_cmd: str, report_path: str = _TS_REPORT_PATH) -> str:
+    """Return the runner command with JSON-report flags appended.
+
+    vitest uses ``--reporter=json``; jest (and unknown runners, which get
+    the jest-compatible flag) use ``--json``. Both write to *report_path*.
+    """
+    cmd = normalize_ts_runner_cmd(raw_cmd)
+    if "vitest" in cmd:
+        flags = f"--reporter=json --outputFile={report_path}"
+    else:
+        flags = f"--json --outputFile={report_path}"
+    return f"{cmd} {flags}"
+
+
+def _ts_make_test_cmd(env_spec: AnyEnvironmentSpec) -> str:
+    """Build the TypeScript test command for the generic F2P run script.
+
+    The grader appends the test scope and pipes combined output through
+    ``tee``, so this returns a ``sh -c`` wrapper that:
+
+    - forwards the scope file arguments via ``"$@"``,
+    - forces non-watch mode (``CI=1`` plus ``vitest run`` normalisation),
+    - writes the JSON report to a file and cats it as the only stdout,
+      removing any stale report first so a crashed run can never surface
+      the previous phase's results.
+    """
+    spec = env_spec if isinstance(env_spec, EnvironmentSpec) else None
+    raw_cmd = (spec.test_cmd if spec and spec.test_cmd else None) or "npx vitest run"
+
+    # The wrapper below relies on single quotes; drop any that would
+    # break out of it (discovery emits plain commands in practice).
+    inner = ts_report_command(raw_cmd).replace("'", "")
+
+    return (
+        f"sh -c 'rm -f {_TS_REPORT_PATH}; "
+        f'CI=1 {inner} "$@" >/dev/null 2>&1; '
+        f"cat {_TS_REPORT_PATH} 2>/dev/null; echo' swebenchify-ts"
+    )
+
+
+# Default discovery patterns of jest (**/__tests__/**, **/?(*.)+(spec|test).[jt]s?(x))
+# and vitest (**/*.{test,spec}.?(c|m)[jt]s?(x)): only files the runners would
+# pick up on their own are passed as scope arguments.
+_TS_TEST_BASENAME_RE = re.compile(r"(?:^|\.)(?:test|spec)\.(?:c|m)?[jt]sx?$")
+
+
+def _ts_test_scope(test_patch: str) -> str:
+    """Return space-separated test file paths from diff headers."""
+    files: list[str] = []
+    for line in test_patch.splitlines():
+        if not line.startswith("diff --git"):
+            continue
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        b_path = parts[3]
+        path = b_path[2:] if b_path.startswith("b/") else b_path
+        basename = Path(path).name
+        in_tests_dir = "__tests__/" in path
+        if not (_TS_TEST_BASENAME_RE.search(basename) or in_tests_dir):
+            continue
+        if in_tests_dir and not re.search(r"\.(?:c|m)?[jt]sx?$", basename):
+            continue
+        if path not in files:
+            files.append(path)
+    return " ".join(files)
+
+
+# ---------------------------------------------------------------------------
 # Register built-in backends
 # ---------------------------------------------------------------------------
 
@@ -606,4 +766,16 @@ register_backend(LanguageBackend(
     test_scope=_rust_test_scope,
     normalize_f2p=normalize_rust_f2p,
     is_test_hunk=_rust_is_test_hunk,
+))
+
+register_backend(LanguageBackend(
+    name="typescript",
+    test_file_pattern=".ts",
+    failure_grep='"numFailedTests": *[1-9]\\|"numFailedTestSuites": *[1-9]',
+    default_timeout=600,
+    parser=TypeScriptJestJSONParser(),
+    make_dockerfile=_ts_make_dockerfile,
+    make_test_cmd=_ts_make_test_cmd,
+    test_scope=_ts_test_scope,
+    normalize_f2p=normalize_typescript_f2p,
 ))

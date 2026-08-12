@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 #
 # "testdata" is Go's convention for embedding fixture files alongside
 # package code; those files are test-only and must not appear in the gold
-# patch.
-_TEST_DIR_NAMES = {"test", "tests", "e2e", "testing", "testdata"}
+# patch.  "__tests__" is the jest convention for co-located test dirs.
+_TEST_DIR_NAMES = {"test", "tests", "e2e", "testing", "testdata", "__tests__"}
 
 _TEST_FILE_PATTERNS = [
     re.compile(r"^test_"),        # test_foo.py

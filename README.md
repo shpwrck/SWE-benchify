@@ -4,7 +4,7 @@
 
 A harness that dispatches [Claude Code](https://claude.ai/claude-code) agents to transform GitHub repositories into [SWE-bench](https://github.com/princeton-nlp/SWE-bench)-compatible benchmarks. See the [research page](https://ai-innovation.team/SWE-benchify/) for methodology and results.
 
-Supports **Python**, **Go**, **Java** (Maven), and **Rust** (Cargo) repositories out of the box.
+Supports **Python**, **Go**, **Java** (Maven), **Rust** (Cargo), and **TypeScript** (vitest/jest) repositories out of the box.
 
 Given a list of GitHub repos, SWE-benchify:
 
@@ -644,6 +644,10 @@ python scripts/discover_and_validate.py --language java \
 # Rust (Cargo)
 python scripts/discover_and_validate.py --language rust \
     --repo cloudflare/pingora --max-prs 200
+
+# TypeScript (vitest or jest)
+python scripts/discover_and_validate.py --language typescript \
+    --repo colinhacks/zod --max-prs 300
 ```
 
 The script auto-detects language version and build settings from project files
@@ -672,6 +676,18 @@ PRs (e.g. `--jira-projects WFLY,WFCORE`).
 `#[cfg(test)]` blocks are automatically moved from the gold patch to the test
 patch.
 
+**TypeScript** auto-detects the Node.js version (`engines.node`, `.nvmrc`),
+the package manager (`packageManager` field, then lockfiles: pnpm-lock.yaml /
+yarn.lock / package-lock.json), and the test runner (vitest or jest from
+devDependencies). The test command must be an invocable runner (e.g.
+`npx vitest run` or `npx jest`) — its JSON report (`--reporter=json` /
+`--json`) is what validation parses. Test IDs are
+`{relative/suite/path}::{fullName}`. `--base-image` and `--run-preamble`
+work as for Python. TypeScript-first scope cut: candidates whose test
+patch touches only `.js` test files are rejected at validation
+("test_patch contains no .ts files"); mixed `.ts`+`.js` test patches
+pass and both kinds are run.
+
 ### GitHub Actions workflows
 
 Each language has a workflow that invokes the unified script:
@@ -680,6 +696,7 @@ Each language has a workflow that invokes the unified script:
 gh workflow run python-pipeline.yml -f repo="containers/podman-compose"
 gh workflow run java-pipeline.yml -f repo="apache/commons-lang"
 gh workflow run rust-pipeline.yml -f repo="cloudflare/pingora"
+gh workflow run typescript-pipeline.yml -f repo="colinhacks/zod"
 ```
 
 Language-specific overrides are available as workflow inputs.
@@ -725,6 +742,15 @@ Rust validation images use `rust:{version}-slim` as the base image. Like Go,
 each spec produces a deterministic image tag based on the `env_spec_hash`.
 The `RustSpecRegistry` maps spec hashes to stable version strings of the
 form `{rust_version}-{hash[:8]}` (e.g. `1.84-ab3f1200`).
+
+### TypeScript images
+
+TypeScript validation images use `node:{version}-slim` as the base image
+(defaulting to Node 20), install git and ca-certificates, enable corepack
+(so a `packageManager` pin selects the right pnpm/yarn), and install
+dependencies with the detected package manager (`npm ci || npm install` by
+default). `--base-image` overrides the base for repos needing native build
+toolchains (node-gyp: add `--system-deps "python3,make,g++"`).
 
 ### Python images
 
@@ -832,7 +858,7 @@ The generated `test.sh` scripts include anti-reward-hacking logic that prevents 
 3. **Overlay** — apply the canonical `test.patch` on top of the agent's source changes
 4. **Grade** — run tests and compare against the expected FAIL_TO_PASS / PASS_TO_PASS lists
 
-Templates are provided for all four supported languages: Go, Python, Java (Maven Surefire), and Rust (cargo test).
+Templates are provided for all five supported languages: Go, Python, Java (Maven Surefire), Rust (cargo test), and TypeScript (jest/vitest JSON report, graded with node since node:slim images ship no python).
 
 ### Running evaluations
 

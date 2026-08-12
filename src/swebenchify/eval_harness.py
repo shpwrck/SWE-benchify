@@ -5,14 +5,31 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import shlex
 import subprocess
 from dataclasses import asdict
 
+from swebenchify.backends import normalize_ts_runner_cmd
 from swebenchify.dispatcher import CostTracker, run_agent_task
 from swebenchify.models import EnvironmentSpec, EvalResult, Repository, TaskInstance
 from swebenchify.workspace import WorkspaceManager
 
 logger = logging.getLogger(__name__)
+
+
+def _ts_single_test_cmd(test_cmd: str, test_id: str) -> str:
+    """Rerun one TypeScript test: the suite file filtered by test name.
+
+    TS IDs are ``{suite_path}::{fullName}``; both jest and vitest accept
+    ``-t <pattern>`` (a regex, hence the escaping) to filter by full name.
+    """
+    suite_path, _, full_name = test_id.partition("::")
+    base = normalize_ts_runner_cmd(test_cmd or "npx vitest run")
+    return (
+        f"CI=1 {base} {shlex.quote(suite_path)} "
+        f"-t {shlex.quote(re.escape(full_name))}"
+    )
 
 SOLVE_PROMPT = '''You are a software engineer fixing a bug in {repo}.
 
@@ -191,9 +208,12 @@ async def eval_instance(
             # Run the specific test by appending the test ID to the base command
             # pytest accepts test IDs directly; other frameworks may need adaptation
             test_cmd = f"{env_spec.test_cmd} {test_id}" if "::" in test_id else env_spec.test_cmd
-            # For pytest-style test IDs, run them directly
             if "::" in test_id:
-                test_cmd = f"python -m pytest {test_id} -x -q"
+                if env_spec.language == "typescript":
+                    test_cmd = _ts_single_test_cmd(env_spec.test_cmd, test_id)
+                else:
+                    # pytest-style test IDs run directly
+                    test_cmd = f"python -m pytest {test_id} -x -q"
             test_proc = subprocess.run(
                 test_cmd, shell=True, cwd=str(worktree),
                 capture_output=True, text=True, timeout=120,
