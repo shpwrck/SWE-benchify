@@ -37,6 +37,17 @@ class TestExtractResolvedIssues:
     def test_fixed_in_commit(self) -> None:
         assert extract_resolved_issues("fixed #42 in commit abc") == [42]
 
+    def test_bare_number_with_prose_suffix_is_not_a_link(self) -> None:
+        """Prose like 'a fixed 200K window' must not register issue #200."""
+        assert extract_resolved_issues(
+            "divided every peak by a fixed 200K window") == []
+        assert extract_resolved_issues(
+            "fixed 200,000-token denominator") == []
+
+    def test_hash_form_allows_trailing_comma(self) -> None:
+        """The suffix guard applies only to hash-less numbers."""
+        assert extract_resolved_issues("fixes #123, and more") == [123]
+
     def test_case_insensitive(self) -> None:
         assert extract_resolved_issues("CLOSES #10") == [10]
 

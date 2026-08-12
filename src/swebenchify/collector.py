@@ -21,10 +21,18 @@ from swebenchify.models import CandidatePR, Repository
 
 logger = logging.getLogger(__name__)
 
-# SWE-bench keyword regex: matches "keyword #number" patterns.
-# The keyword must be one of the close/fix/resolve family.
+# SWE-bench keyword regex: matches "keyword #number" and (per SPEC)
+# hash-less "keyword number" patterns. The keyword must be one of the
+# close/fix/resolve family.
+# A hash-less number must NOT be followed by a word character or comma:
+# otherwise prose like "divided by a fixed 200K window" or a "fixed
+# 200,000-token denominator" registers as a link to issue #200 and the
+# extractor attaches that issue's body as the problem statement. The
+# suffix guard applies only to the hash-less form — "fixes #123," with
+# a trailing comma is a real link. ("fixed 3 typos" remains a known
+# residual ambiguity of the SPEC's hash-less rule.)
 _ISSUE_KEYWORD_PATTERN = re.compile(
-    r"(\w+)\s+#?(\d+)", re.IGNORECASE
+    r"(\w+)\s+(?:#(\d+)|(\d+)(?![\w,]))", re.IGNORECASE
 )
 
 _KEYWORDS = frozenset({
@@ -141,7 +149,7 @@ def extract_resolved_issues(text: str | None) -> list[int]:
     for match in _ISSUE_KEYWORD_PATTERN.finditer(text):
         keyword = match.group(1).lower()
         if keyword in _KEYWORDS:
-            issues.add(int(match.group(2)))
+            issues.add(int(match.group(2) or match.group(3)))
     return sorted(issues)
 
 
